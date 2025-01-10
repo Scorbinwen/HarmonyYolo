@@ -158,7 +158,10 @@ def train(hyp, opt, device, callbacks):
 
     # Config
     plots = not evolve and not opt.noplots  # create plots
-    overlap = not opt.no_overlap
+    combine_mask = opt.combine_mask
+    overlap = (not opt.no_overlap) and (not combine_mask)
+    one_anchor_multi_class = opt.one_anchor_multi_class
+
     cuda = device.type != "cpu"
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
     with torch_distributed_zero_first(LOCAL_RANK):
@@ -322,7 +325,7 @@ def train(hyp, opt, device, callbacks):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model, overlap=overlap)  # init loss class
+    compute_loss = ComputeLoss(model, overlap=overlap, one_anchor_multi_class=one_anchor_multi_class, combine_mask=combine_mask)  # init loss class
     # callbacks.run('on_train_start')
     LOGGER.info(
         f'Image sizes {imgsz} train, {imgsz} val\n'
@@ -447,6 +450,7 @@ def train(hyp, opt, device, callbacks):
                     compute_loss=compute_loss,
                     mask_downsample_ratio=mask_ratio,
                     overlap=overlap,
+                    combine_mask=combine_mask,
                 )
 
             # Update best mAP
@@ -518,7 +522,8 @@ def train(hyp, opt, device, callbacks):
                         compute_loss=compute_loss,
                         mask_downsample_ratio=mask_ratio,
                         overlap=overlap,
-                    )  # val best model with plots
+                        combine_mask=combine_mask
+                    ) # val best model with plots
                     if is_coco:
                         # callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
                         metrics_dict = dict(zip(KEYS, list(mloss) + list(results) + lr))
@@ -566,6 +571,8 @@ def parse_opt(known=False):
     parser.add_argument("--image-weights", action="store_true", help="use weighted image selection for training")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--multi-scale", action="store_true", help="vary img-size +/- 50%%")
+    parser.add_argument('--one_anchor_multi_class', action='store_true', default=True, help='allow one anchor train by multiple class each time')
+    parser.add_argument('--combine_mask', action='store_true', default=False, help='combine masks of the same class.')
     parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
     parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW"], default="SGD", help="optimizer")
     parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")

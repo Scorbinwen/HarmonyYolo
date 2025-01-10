@@ -14,7 +14,7 @@ from .general import crop_mask
 class ComputeLoss:
     """Computes the YOLOv5 model's loss components including classification, objectness, box, and mask losses."""
 
-    def __init__(self, model, autobalance=False, overlap=False):
+    def __init__(self, model, autobalance=False, overlap=False, one_anchor_multi_class=False, combine_mask=False):
         """Initializes the compute loss function for YOLOv5 models with options for autobalancing and overlap
         handling.
         """
@@ -45,10 +45,15 @@ class ComputeLoss:
         self.nm = m.nm  # number of masks
         self.anchors = m.anchors
         self.device = device
+        self.one_anchor_multi_class = one_anchor_multi_class
+        self.combine_mask = combine_mask
 
     def __call__(self, preds, targets, masks):  # predictions, targets, model
         """Evaluates YOLOv5 model's loss for given predictions, targets, and masks; returns total loss components."""
-        p, proto = preds
+        if self.combine_mask:
+            p, proto, mask_pred = preds
+        else:
+            p, proto = preds
         bs, nm, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         lcls = torch.zeros(1, device=self.device)
         lbox = torch.zeros(1, device=self.device)
@@ -63,8 +68,11 @@ class ComputeLoss:
 
             n = b.shape[0]  # number of targets
             if n:
-                pxy, pwh, _, pcls, pmask = pi[b, a, gj, gi].split((2, 2, 1, self.nc, nm), 1)  # subset of predictions
-
+                if self.combine_mask:
+                    pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # subset of predictions
+                    pmask = mask_pred
+                else:
+                    pxy, pwh, _, pcls, pmask = pi[b, a, gj, gi].split((2, 2, 1, self.nc, nm), 1)  # subset of predictions
                 # Box regression
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
@@ -85,6 +93,9 @@ class ComputeLoss:
                 if self.nc > 1:  # cls loss (only if multiple classes)
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
                     t[range(n), tcls[i]] = self.cp
+                    if self.one_anchor_multi_class:
+                        t = self.merge_by_anchor(t, indices[i], type="label")
+                        pcls = self.merge_by_anchor(pcls, indices[i], type="pred")
                     lcls += self.BCEcls(pcls, t)  # BCE
 
                 # Mask regression
@@ -98,7 +109,16 @@ class ComputeLoss:
                         mask_gti = torch.where(masks[bi][None] == tidxs[i][j].view(-1, 1, 1), 1.0, 0.0)
                     else:
                         mask_gti = masks[tidxs[i]][j]
-                    lseg += self.single_mask_loss(mask_gti, pmask[j], proto[bi], mxyxy[j], marea[j])
+                    if self.combine_mask:
+                        # merge mask for mask_gti
+                        mask_gti_cls = self.combine_mask_by_class(mask_gti, tcls[i][j], pmask[bi])
+
+                        mask_gti_anchor = self.extract_mask_by_anchor(mask_gti_cls, tcls[i][j])
+                        pmask_anchor = self.extract_mask_by_anchor(pmask[bi], tcls[i][j])
+
+                        lseg += self.comb_mask_loss(mask_gti_anchor, pmask_anchor, mxyxy[j], marea[j])
+                    else:
+                        lseg += self.single_mask_loss(mask_gti, pmask[j], proto[bi], mxyxy[j], marea[j])
 
             obji = self.BCEobj(pi[..., 4], tobj)
             lobj += obji * self.balance[i]  # obj loss
@@ -118,6 +138,47 @@ class ComputeLoss:
     def single_mask_loss(self, gt_mask, pred, proto, xyxy, area):
         """Calculates and normalizes single mask loss for YOLOv5 between predicted and ground truth masks."""
         pred_mask = (pred @ proto.view(self.nm, -1)).view(-1, *proto.shape[1:])  # (n,32) @ (32,80,80) -> (n,80,80)
+        loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
+        return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).mean()
+
+    def merge_bitwise(self, t, type):
+        if type == "pred":
+            return t[0]
+        comb_t = torch.zeros_like(t[0])
+        for e in t:
+            comb_t += e
+
+        # 对于多个anchor有相同class label的情况，comb_t会累加成大于1的值，因此需要裁剪
+        comb_t = torch.clamp(comb_t, min=0, max=1)
+        return comb_t
+
+    def merge_by_anchor(self, t, indices, type):
+        combine_id = torch.stack(indices, dim=1)
+        unique_comb_id = torch.unique(combine_id, dim=0)
+        result = []
+
+        for val in unique_comb_id:
+            # 获取 `a` 中等于当前 `val` 的索引
+            indices = torch.all(combine_id == val, dim=1).nonzero(as_tuple=True)[0]
+            comb = self.merge_bitwise(t[indices], type)
+            result.append(comb)
+
+        # 合并结果
+        result = torch.stack(result, dim=0)
+        return result
+
+    def combine_mask_by_class(self, mask_gti, tcls, pmask):
+        mask_gt_cls = torch.zeros(pmask.shape, device=mask_gti.device)
+        for c in range(pmask.shape[0]):
+            mask_gt_cls[c] = torch.clamp(torch.sum(mask_gti[tcls == c], dim=0), min=0, max=1)
+        return mask_gt_cls
+
+    def extract_mask_by_anchor(self, mask, tcls):
+        mask_anchor = mask[tcls]
+        return mask_anchor
+
+    def comb_mask_loss(self, gt_mask, pred_mask, xyxy, area):
+        # Mask loss for one image
         loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
         return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).mean()
 

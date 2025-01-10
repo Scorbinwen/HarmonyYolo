@@ -64,7 +64,7 @@ from utils.general import (
 from utils.metrics import ConfusionMatrix, box_iou
 from utils.plots import output_to_target, plot_val_study
 from utils.segment.dataloaders import create_dataloader
-from utils.segment.general import mask_iou, process_mask, process_mask_native, scale_image
+from utils.segment.general import mask_iou, process_mask, process_mask_native, scale_image, process_combine_mask
 from utils.segment.metrics import Metrics, ap_per_class_box_and_mask
 from utils.segment.plots import plot_images_and_masks
 from utils.torch_utils import de_parallel, select_device, smart_inference_mode
@@ -183,6 +183,7 @@ def run(
     mask_downsample_ratio=1,
     compute_loss=None,
     callbacks=Callbacks(),
+    combine_mask=False,
 ):
     """Validates a YOLOv5 segmentation model on specified dataset, producing metrics, plots, and optional JSON
     output.
@@ -200,6 +201,7 @@ def run(
         half &= device.type != "cpu"  # half precision only supported on CUDA
         model.half() if half else model.float()
         nm = de_parallel(model).model[-1].nm  # number of masks
+        combine_mask = de_parallel(model).model[-1].combine_mask  # number of masks
     else:  # called directly
         device = select_device(device, batch_size=batch_size)
 
@@ -213,6 +215,7 @@ def run(
         imgsz = check_img_size(imgsz, s=stride)  # check image size
         half = model.fp16  # FP16 supported on limited backends with CUDA
         nm = de_parallel(model).model.model[-1].nm if isinstance(model, SegmentationModel) else 32  # number of masks
+        combine_mask = getattr(de_parallel(model).model[-1], "combine_mask", combine_mask) if isinstance(model, SegmentationModel) else combine_mask # number of masks
         if engine:
             batch_size = model.batch_size
         else:
@@ -296,11 +299,22 @@ def run(
 
         # Inference
         with dt[1]:
-            preds, protos, train_out = model(im) if compute_loss else (*model(im, augment=augment)[:2], None)
+            if combine_mask:
+                if compute_loss:
+                    preds, protos, train_out, mask_pred = model(im)
+                else:
+                    out = model(im, augment=augment)
+                    preds, protos, train_out, mask_pred = (out[:2], None, out[-1])
+            else:
+                preds, protos, train_out = model(im) if compute_loss else (*model(im, augment=augment)[:2], None)
 
         # Loss
         if compute_loss:
-            loss += compute_loss((train_out, protos), targets, masks)[1]  # box, obj, cls
+            if combine_mask:
+                inp = (train_out, protos, mask_pred)
+            else:
+                inp = (train_out, protos)
+            loss += compute_loss(inp, targets, masks)[1]  # box, obj, cls
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
@@ -330,7 +344,12 @@ def run(
             # Masks
             midx = [si] if overlap else targets[:, 0] == si
             gt_masks = masks[midx]
-            pred_masks = process(proto, pred[:, 6:], pred[:, :4], shape=im[si].shape[1:])
+            if not combine_mask:
+                pred_masks = process(proto, pred[:, 6:], pred[:, :4], shape=im[si].shape[1:])
+            else:
+                mask_pred_si = mask_pred[si]
+                pred_masks = process_combine_mask(mask_pred_si, pred[:, 5], pred[:, :4], shape=im[si].shape[1:])
+                pred_masks = torch.as_tensor(pred_masks, dtype=torch.float32)
 
             # Predictions
             if single_cls:
@@ -461,6 +480,7 @@ def parse_opt():
     parser.add_argument("--task", default="val", help="train, val, test, speed or study")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
+    parser.add_argument('--combine_mask', action='store_true', default=False, help='combine masks of the same class.')
     parser.add_argument("--single-cls", action="store_true", help="treat as single-class dataset")
     parser.add_argument("--augment", action="store_true", help="augmented inference")
     parser.add_argument("--verbose", action="store_true", help="report mAP by class")
