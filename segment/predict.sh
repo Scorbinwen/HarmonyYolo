@@ -1,0 +1,1 @@
+python predict.py  --data ../data/coco.yaml  --weights ../weights/yolov5s-seg.pt --source /workspace/data/coco/images/mask_overlap/

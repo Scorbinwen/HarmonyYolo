@@ -1,1 +1,1 @@
-python -m torch.distributed.launch --nproc_per_node 2  --master_port 29503 --use_env train.py --sync-bn --batch-size 200 --workers 2 --device 1,2 --save-period 30 --data ../data/coco128-seg.yaml --cfg ../models/segment/yolov5s-seg-combine_mask.yaml  --combine_mask
+python -m torch.distributed.launch --nproc_per_node 2  --master_port 29503 --use_env train.py --sync-bn --batch-size 160 --workers 2 --device 0,1 --save-period 30 --data ../data/coco.yaml  --cfg ../models/segment/yolov5s-seg-combine_mask.yaml --combine_mask

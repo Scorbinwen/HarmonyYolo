@@ -94,8 +94,8 @@ class ComputeLoss:
                     t = torch.full_like(pcls, self.cn, device=self.device)  # targets
                     t[range(n), tcls[i]] = self.cp
                     if self.one_anchor_multi_class:
-                        t = self.merge_by_anchor(t, indices[i], type="label")
-                        pcls = self.merge_by_anchor(pcls, indices[i], type="pred")
+                        t = self.merge_by_anchor(t, indices[i])
+                        pcls = self.merge_by_anchor(pcls, indices[i])
                     lcls += self.BCEcls(pcls, t)  # BCE
 
                 # Mask regression
@@ -112,10 +112,8 @@ class ComputeLoss:
                     if self.combine_mask:
                         # merge mask for mask_gti
                         mask_gti_cls = self.combine_mask_by_class(mask_gti, tcls[i][j], pmask[bi])
-
                         mask_gti_anchor = self.extract_mask_by_anchor(mask_gti_cls, tcls[i][j])
                         pmask_anchor = self.extract_mask_by_anchor(pmask[bi], tcls[i][j])
-
                         lseg += self.comb_mask_loss(mask_gti_anchor, pmask_anchor, mxyxy[j], marea[j])
                     else:
                         lseg += self.single_mask_loss(mask_gti, pmask[j], proto[bi], mxyxy[j], marea[j])
@@ -141,36 +139,24 @@ class ComputeLoss:
         loss = F.binary_cross_entropy_with_logits(pred_mask, gt_mask, reduction="none")
         return (crop_mask(loss, xyxy).mean(dim=(1, 2)) / area).mean()
 
-    def merge_bitwise(self, t, type):
-        if type == "pred":
-            return t[0]
-        comb_t = torch.zeros_like(t[0])
-        for e in t:
-            comb_t += e
-
-        # 对于多个anchor有相同class label的情况，comb_t会累加成大于1的值，因此需要裁剪
-        comb_t = torch.clamp(comb_t, min=0, max=1)
-        return comb_t
-
-    def merge_by_anchor(self, t, indices, type):
+    def merge_by_anchor(self, t, indices):
+        """
+        memory usage is too large to be disabled.
+        """
         combine_id = torch.stack(indices, dim=1)
         unique_comb_id = torch.unique(combine_id, dim=0)
-        result = []
-
-        for val in unique_comb_id:
-            # 获取 `a` 中等于当前 `val` 的索引
-            indices = torch.all(combine_id == val, dim=1).nonzero(as_tuple=True)[0]
-            comb = self.merge_bitwise(t[indices], type)
-            result.append(comb)
-
-        # 合并结果
-        result = torch.stack(result, dim=0)
-        return result
+        anchor_index = torch.all(unique_comb_id[:, None, :] == combine_id[None, :, :], dim=-1).float()
+        merge_t = anchor_index[:, :, None] * t[None, :, :]
+        merge_t_min, _ = torch.min(merge_t, dim=1)
+        merge_t_max, _ = torch.max(merge_t, dim=1)
+        merge_targets = merge_t_min + merge_t_max
+        trans_anchor_index = anchor_index.transpose(0, 1).detach()
+        result_t = torch.einsum('bi,ik->bk', trans_anchor_index, merge_targets)
+        return result_t
 
     def combine_mask_by_class(self, mask_gti, tcls, pmask):
-        mask_gt_cls = torch.zeros(pmask.shape, device=mask_gti.device)
-        for c in range(pmask.shape[0]):
-            mask_gt_cls[c] = torch.clamp(torch.sum(mask_gti[tcls == c], dim=0), min=0, max=1)
+        cls_ind = (torch.arange(0, pmask.shape[0], device=mask_gti.device)[:, None] == tcls[None, :]).float()
+        mask_gt_cls = torch.clamp(torch.einsum('bi,ijk->bjk', cls_ind, mask_gti), min=0, max=1)
         return mask_gt_cls
 
     def extract_mask_by_anchor(self, mask, tcls):

@@ -1,0 +1,1 @@
+python images_picker.py  --data ../data/coco.yaml  --weights ../weights/yolov5s-seg.pt --device 2 --batch-size 1 --tgt_img_dir /workspace/data/coco/images/mask_overlap --tgt_lbl_dir /workspace/data/coco/labels/mask_overlap
